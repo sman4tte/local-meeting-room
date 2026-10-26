@@ -101,7 +101,7 @@ const rid = () => {
   try { crypto.getRandomValues(a); } catch { for (let i = 0; i < 8; i++) a[i] = Math.random() * 256; }
   return [...a].map((n) => n.toString(16).padStart(2, '0')).join('').slice(0, 10);
 };
-const me = 'p' + rid();
+let me = 'p' + rid();
 const peers = new Map(); // id -> {pc, tile, queue, name}
 // ===== PENGATURAN =====
 // Tempel URL Web App Google Apps Script (berakhiran /exec) di bawah ini.
@@ -154,7 +154,8 @@ async function enter(viewer) {
   $('call').classList.add('open');
   $('roomLabel').textContent = room;
   history.replaceState(null, '', '?room=' + encodeURIComponent(room));
-  addTile(me, myName + ' (Anda)', local, true);
+  const mine = addTile(me, myName + ' (Anda)', local, true);
+  if (!local.getVideoTracks().length) mine.querySelector('span').textContent += ' · kamera tidak aktif';
   if (!local.getAudioTracks().length) $('bMic').disabled = true;
   if (!local.getVideoTracks().length) { $('bCam').disabled = true; $('bScr').disabled = true; }
   startTimer();
@@ -167,7 +168,7 @@ async function getMedia() {
   const md = navigator.mediaDevices;
   if (!md || !md.getUserMedia) throw Object.assign(new Error('mediaDevices tidak tersedia'), { name: 'NoMediaDevices' });
   const tries = [
-    { video: true, audio: { echoCancellation: true, noiseSuppression: true } },
+    { video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24 } }, audio: { echoCancellation: true, noiseSuppression: true } },
     { audio: true },   // tanpa kamera
     { video: true },   // tanpa mikrofon
   ];
@@ -183,7 +184,7 @@ async function getMedia() {
   throw first;
 }
 
-let alive = true, since = 0;
+let alive = true, since = 0, hasTurn = false, gen = 0, lastSync = Date.now(), rejoining = false;
 const outbox = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const status = (t) => ($('status').textContent = t ? ' · ' + t : '');
@@ -198,35 +199,86 @@ async function api(body) {
 }
 
 async function connect() {
+  const g = ++gen;
   try {
     const j = await api({ action: 'join', room, id: me, name: myName });
+    if (g !== gen) return;
     since = j.since;
+    const extra = Array.isArray(j.ice) ? j.ice : [];
+    hasTurn = JSON.stringify(extra).includes('turn:') || JSON.stringify(extra).includes('turns:');
+    ice = { iceServers: CONFIG.ICE_SERVERS.concat(extra) };
     // Pendatang baru yang memulai offer ke semua peserta yang sudah ada
     j.peers.forEach((p) => makePeer(p.id, p.name, true));
-  } catch (err) { status('Gagal tersambung ke Google Sheets: ' + err.message); return; }
-  loop();
+  } catch (err) {
+    status('Gagal tersambung ke Google Sheets: ' + err.message + '. Mencoba lagi…');
+    await sleep(3000);
+    if (g === gen && alive) return connect();
+    return;
+  }
+  lastSync = Date.now();
+  status('');
+  loop(g);
 }
 
 // Polling: kirim pesan keluar dan ambil pesan masuk dalam satu permintaan.
-async function loop() {
-  while (alive) {
+// Cepat saat ada sambungan yang sedang dibangun, santai bila semua sudah tersambung.
+async function loop(g) {
+  while (alive && g === gen) {
+    // Tab sempat membeku (HP ke latar belakang, layar mati, sinyal hilang): server sudah
+    // menganggap kita keluar dan peserta lain sudah membuang sambungan kita, jadi masuk ulang.
+    if (Date.now() - lastSync > 20000) { rejoin(); return; }
     const out = outbox.splice(0);
     let busy = false;
     try {
       const r = await api({ action: 'sync', room, id: me, name: myName, since, out });
+      if (g !== gen) return;
       status('');
       since = r.since;
+      lastSync = Date.now();
       const names = Object.fromEntries(r.peers.map((p) => [p.id, p.name]));
       for (const s of r.signals) await onSignal(s, names);
       reconcile(r.peers);
-      busy = r.signals.length > 0 || out.length > 0;
+      const now = Date.now();
+      busy = r.signals.length > 0 || out.length > 0 ||
+        [...peers.values()].some((p) => p.pc.connectionState !== 'connected' && now - p.born < 45000);
     } catch (err) {
       outbox.unshift(...out);
       status('Koneksi ke Google Sheets terganggu, mencoba lagi');
     }
-    await sleep(busy ? 250 : 800);
+    await sleep(busy ? 150 : 1200);
   }
 }
+
+// Masuk ulang dengan ID baru: sambungan lama dibuang, lalu menawarkan sambungan baru ke semua peserta.
+async function rejoin() {
+  if (rejoining || !room) return;
+  rejoining = true;
+  try {
+    status('Menyambung ulang…');
+    const old = me;
+    gen++;                                   // hentikan loop lama
+    api({ action: 'leave', room, id: old }).catch(() => {});
+    [...peers.keys()].forEach((id) => removePeer(id));
+    outbox.length = 0;
+    // Kamera/mikrofon sering dimatikan sistem saat aplikasi di latar belakang.
+    if (local && local.getTracks().some((t) => t.readyState === 'ended')) {
+      try {
+        const m = await getMedia();
+        local.getTracks().forEach((t) => t.stop());
+        local = m; camTrack = local.getVideoTracks()[0];
+        const lv = document.querySelector('.tile.me video'); if (lv) lv.srcObject = local;
+      } catch (err) { console.error(err); }
+    }
+    me = 'p' + rid();
+    alive = true;
+    await connect();
+  } finally { rejoining = false; }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && room && Date.now() - lastSync > 20000) rejoin();
+});
+addEventListener('online', () => { if (room && Date.now() - lastSync > 20000) rejoin(); });
+addEventListener('pageshow', (e) => { if (e.persisted && room) rejoin(); });
 
 async function onSignal({ from, to, data }, names) {
   if (to === '*') return addMsg(names[from] || 'Tamu', data.chat || '');
@@ -258,19 +310,34 @@ function reconcile(list) {
 function post(to, data) { outbox.push({ to, data }); }
 
 function makePeer(id, name, initiator) {
-  const pc = new RTCPeerConnection(ice);
-  const p = { pc, queue: [], name, tile: null, miss: 0 };
+  let pc;
+  try { pc = new RTCPeerConnection(ice); }
+  catch (err) { console.error(err); pc = new RTCPeerConnection({ iceServers: CONFIG.ICE_SERVERS }); }
+  const p = { pc, queue: [], name, tile: null, label: null, miss: 0, born: Date.now() };
   peers.set(id, p);
   local.getTracks().forEach((t) => pc.addTrack(t, local));
   if (!local.getAudioTracks().length) pc.addTransceiver('audio', { direction: 'recvonly' });
   if (!local.getVideoTracks().length) pc.addTransceiver('video', { direction: 'recvonly' });
   const remote = new MediaStream();
   p.tile = addTile(id, name, remote, false);
-  pc.ontrack = (e) => { remote.addTrack(e.track); const v = p.tile.querySelector('video'); v.play().catch(() => {}); };
+  p.label = p.tile.querySelector('span');
+  refresh(p);
+  pc.ontrack = (e) => {
+    const v = p.tile.querySelector('video');
+    const ms = e.streams && e.streams[0];
+    if (ms) { if (v.srcObject !== ms) v.srcObject = ms; } else remote.addTrack(e.track);
+    e.track.onunmute = () => refresh(p);
+    e.track.onmute = () => refresh(p);
+    tryPlay(v);
+    refresh(p);
+  };
   pc.onicecandidate = (e) => e.candidate && post(id, { ice: e.candidate });
   pc.onconnectionstatechange = () => {
+    refresh(p);
     if (pc.connectionState === 'failed') {
-      status('Sambungan video ke ' + name + ' gagal. Jaringan peserta mungkin memblokir koneksi langsung dan butuh server TURN (lihat README).');
+      status('Sambungan video ke ' + name + ' gagal. ' + (hasTurn
+        ? 'Server TURN sudah aktif; periksa jaringan peserta atau kuota TURN.'
+        : 'Jaringan peserta memblokir koneksi langsung dan server TURN belum diatur (lihat README).'));
       if (initiator) pc.restartIce();
     } else if (pc.connectionState === 'connected') status('');
   };
@@ -283,6 +350,37 @@ function makePeer(id, name, initiator) {
   return p;
 }
 
+// Keterangan di bawah tiap tile: membantu mengetahui kamera tidak tampil karena apa.
+function refresh(p) {
+  if (!p.label) return;
+  const st = p.pc.connectionState;
+  const vr = p.pc.getReceivers().find((r) => r.track && r.track.kind === 'video');
+  let t = '';
+  if (st === 'failed') t = 'gagal tersambung';
+  else if (st !== 'connected') t = 'menyambung…';
+  else if (!vr || vr.track.muted) t = 'video belum diterima';
+  p.label.textContent = p.name + (t ? ' · ' + t : '');
+}
+
+// Bila browser menahan pemutaran bersuara, video tetap ditampilkan (tanpa suara) sampai layar diketuk.
+function tryPlay(v) {
+  v.play().catch(() => {
+    if (v.muted) return;
+    v.muted = true; v.dataset.needTap = '1'; v.play().catch(() => {});
+    tapHint(true);
+  });
+}
+function tapHint(on) {
+  let h = document.getElementById('tapHint');
+  if (on && !h) {
+    h = document.createElement('div'); h.id = 'tapHint';
+    h.textContent = 'Ketuk layar untuk mengaktifkan suara peserta lain';
+    h.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);color:#fff;padding:8px 14px;border-radius:8px;z-index:20;font-size:14px';
+    document.body.append(h);
+  }
+  if (!on && h) h.remove();
+}
+
 function removePeer(id) {
   const p = peers.get(id); if (!p) return;
   p.pc.close(); p.tile.remove(); peers.delete(id);
@@ -293,7 +391,7 @@ function addTile(id, name, stream, mine) {
   t.className = 'tile' + (mine ? ' me' : '');
   const v = document.createElement('video');
   v.autoplay = true; v.playsInline = true; v.setAttribute('playsinline', ''); v.muted = mine; v.srcObject = stream;
-  v.play().catch(() => {});
+  tryPlay(v);
   const s = document.createElement('span'); s.textContent = name;
   t.append(v, s); $('grid').append(t);
   return t;
@@ -312,7 +410,13 @@ $('bCam').onclick = (e) => toggle(e.currentTarget, 'video', 'Kamera');
 if (!navigator.mediaDevices || !window.isSecureContext) $('err').textContent = 'Browser ini tidak mengizinkan kamera/mikrofon. Pastikan alamat diawali https:// dan buka lewat Chrome atau Safari.';
 else if (inApp) $('err').textContent = 'Anda membuka tautan dari dalam aplikasi (WhatsApp, Instagram, dll.). Kamera dan mikrofon biasanya diblokir di sini. Ketuk menu titik tiga lalu pilih "Buka di Chrome/Safari", atau salin tautan dan tempel di browser.';
 // Beberapa browser (terutama iPhone) menahan pemutaran otomatis; sentuhan apa pun memulainya.
-document.addEventListener('click', () => document.querySelectorAll('video').forEach((v) => v.paused && v.play().catch(() => {})));
+document.addEventListener('click', () => {
+  document.querySelectorAll('video').forEach((v) => {
+    if (v.dataset.needTap) { v.muted = false; delete v.dataset.needTap; }
+    if (v.paused) v.play().catch(() => {});
+  });
+  tapHint(false);
+});
 
 $('bScr').onclick = async () => {
   const tile = document.querySelector('.tile.me');
@@ -362,7 +466,7 @@ function leaveRoom() {
   alive = false;
   try { navigator.sendBeacon(CONFIG.API_URL, JSON.stringify({ action: 'leave', room, id: me })); } catch {}
 }
-addEventListener('pagehide', () => room && leaveRoom());
+addEventListener('pagehide', (e) => { if (room && !e.persisted) leaveRoom(); });
 
 // Stopwatch hanya penunjuk durasi; tidak ada batas.
 function startTimer() {
